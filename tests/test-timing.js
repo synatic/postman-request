@@ -193,7 +193,9 @@ tape('HTTPS: non-redirected request is timed', function (t) {
     t.equal((res.timingPhases.firstByte > 0), true)
     t.equal((res.timingPhases.download > 0), true)
     t.equal((res.timingPhases.total > 0), true)
-    t.equal((res.timingPhases.total <= (end - start)), true)
+    // timingPhases.total returns a high res time with nano-second precision, where as Date.now returns time with
+    // milli-second precision. Thus, we add a lee-way of atmost 1 millisecond to prevent flaky false-negatives
+    t.equal((res.timingPhases.total <= (end - start + 1)), true)
 
     // validate there are no unexpected properties
     var propNames = []
@@ -232,7 +234,7 @@ tape('HTTPS: redirected request is timed with rollup', function (t) {
 
 tape('HTTPS: keepAlive is timed', function (t) {
   var agent = new https.Agent({ keepAlive: true })
-  var options = { time: true, agent: agent, strictSSL: false }
+  var options = { time: true, agent: agent, strictSSL: false, protocolVersion: 'http1' }
   var start1 = new Date().getTime()
 
   request('https://localhost:' + httpsServer.port + '/', options, function (err1, res1, body1) {

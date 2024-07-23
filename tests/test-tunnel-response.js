@@ -66,7 +66,7 @@ function setListeners (server, type) {
         dest += '->' + match[1]
       }
       event('%s proxy to %s', type, dest)
-      request(req.url, { followRedirect: false }).pipe(res)
+      request(req.url, { followRedirect: false, protocolVersion: 'http1' }).pipe(res)
     }
   })
 
@@ -94,7 +94,13 @@ function setListeners (server, type) {
         'Proxy-Agent: postman-proxy-agent\r\n' +
         '\r\n' +
         'OK')
-      client.pipe(server)
+      const clientPipe = client.pipe(server)
+
+      if (process.versions.node.split('.')[0] === '16') {
+        clientPipe.on('error', function () {
+          // Swallow "This socket has been ended by the other party" error on Node.js 16
+        })
+      };
       server.write(head)
       server.pipe(client)
     })
@@ -354,8 +360,9 @@ function addTests () {
   }, [
     'http connect to localhost:' + ss2.port,
     // it should bubble up the key mismatch error
-    'err error:0B080074:x509 certificate routines:X509_check_private_key:key values mismatch'
-  ])
+    process.versions.node.split('.')[0] < 18
+      ? 'err error:0B080074:x509 certificate routines:X509_check_private_key:key values mismatch'
+      : 'err error:05800074:x509 certificate routines::key values mismatch' ])
 }
 
 tape('setup', function (t) {

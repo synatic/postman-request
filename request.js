@@ -3,6 +3,8 @@
 var tls = require('tls')
 var http = require('http')
 var https = require('https')
+var http2 = require('./lib/http2')
+var autohttp2 = require('./lib/autohttp')
 var url = require('url')
 var util = require('util')
 var stream = require('stream')
@@ -139,9 +141,8 @@ function parseRequestHeaders (headerString) {
   // first element of accumulator is not a header
   // last two elements are empty strings
   for (var i = 1; i < arr.length - 2; i++) {
-    // header name cannot have a ':' but header value allows it
-    // therefore we split on the index of the first ':'
-    var splitIndex = arr[i].indexOf(':')
+    // HTTP/2 specific headers beging with :, so we find the index of the first colon skipping the first character
+    var splitIndex = arr[i].indexOf(':', 1)
 
     acc.push({
       key: arr[i].slice(0, splitIndex),
@@ -274,10 +275,10 @@ Request.prototype.init = function (options) {
   }
   // additional postman feature ends
 
-  // Delete headers with value undefined since they break
+  // Delete headers with value undefined or HTTP/2 specific pseudoheaders since they break
   // ClientRequest.OutgoingMessage.setHeader in node 0.12
   for (var headerName in self.headers) {
-    if (typeof self.headers[headerName] === 'undefined') {
+    if (typeof self.headers[headerName] === 'undefined' || headerName.startsWith(':')) {
       delete self.headers[headerName]
     }
   }
@@ -588,10 +589,17 @@ Request.prototype.init = function (options) {
   }
 
   var protocol = self.proxy && !self.tunnel ? self.proxy.protocol : self.uri.protocol
-  var defaultModules = {'http:': http, 'https:': https}
+  var defaultModules = {'http:': { http2: http, http1: http, auto: http }, 'https:': { http1: https, http2: http2, auto: autohttp2 }}
   var httpModules = self.httpModules || {}
 
-  self.httpModule = httpModules[protocol] || defaultModules[protocol]
+  // If user defines httpModules, respect if they have different httpModules for different http versions, else use the tls specific http module
+  // If the user defines nothing, revert to default modules
+  self.httpModule = (httpModules[protocol] && httpModules[protocol][self.protocolVersion]) || httpModules[protocol] || (defaultModules[protocol] && defaultModules[protocol][self.protocolVersion])
+
+  if (httpModules[protocol] && !(httpModules[protocol][options.protocolVersion])) {
+    // If the user is only specifying https/http modules, revert to http1
+    self.protocolVersion = 'http1'
+  }
 
   if (!self.httpModule) {
     return self.emit('error', new Error('Invalid protocol: ' + protocol))
@@ -897,7 +905,7 @@ Request.prototype.getNewAgent = function () {
   }
 
   // we're using a stored agent.  Make sure it's protocol-specific
-  poolKey = self.uri.protocol + poolKey
+  poolKey = self.protocolVersion + ':' + self.uri.protocol + poolKey
 
   // generate a new agent for this setting if none yet exists
   if (!self.pool[poolKey]) {
@@ -1211,17 +1219,34 @@ Request.prototype.onRequestError = function (error) {
 
 Request.prototype.onRequestResponse = function (response) {
   var self = this
+  // De-referencing self.startTimeNow to prevent race condition during redirects
+  // Race-condition:
+  // 30x-url: Request start (self.startTimeNow initialized (self.start()))
+  // Redirect header to 200 request received
+  // 200-url: Request start (self.startTimeNow re-initialized, old value overwritten (redirect.js -> request.init() -> self.start()))
+  // 30x-url: end event received, timing calculated using new self.startTimeNow (incorrect)
+  //
+  // This must've been happening with http/1.1 as well when using keep-alive, but there were no tests to catch this.
+  // Was highlighted with http/2 where connections are reused by default
+  // Does not show up in http/1.x tests due to delays involving socket establishment
+  //
+  // New flow
+  // 30x-url: Request start (self.startTimeNow initialized)
+  // Redirect header to 200 request received
+  // 200-url: Request start (self.startTimeNow re-initialized, old value overwritten)
+  // 30x-url: end event received, timing calculated using requestSegmentStartTime (correct)
+  const requestSegmentStartTime = self.startTimeNow
 
   if (self.timing) {
-    self.timings.response = now() - self.startTimeNow
+    self.timings.response = now() - requestSegmentStartTime
   }
 
   debug('onRequestResponse', self.uri.href, response.statusCode, response.headers)
   response.on('end', function () {
     if (self.timing) {
-      self.timings.end = now() - self.startTimeNow
+      self.timings.end = now() - requestSegmentStartTime
       response.timingStart = self.startTime
-      response.timingStartTimer = self.startTimeNow
+      response.timingStartTimer = requestSegmentStartTime
 
       // fill in the blanks for any periods that didn't trigger, such as
       // no lookup or connect due to keep alive
@@ -1234,7 +1259,7 @@ Request.prototype.onRequestResponse = function (response) {
       if (!self.timings.connect) {
         self.timings.connect = self.timings.lookup
       }
-      if (!self.timings.secureConnect && self.httpModule === https) {
+      if (!self.timings.secureConnect && self.uri.protocol === 'https:') {
         self.timings.secureConnect = self.timings.connect
       }
       if (!self.timings.response) {
@@ -1284,6 +1309,9 @@ Request.prototype.onRequestResponse = function (response) {
     httpVersion: response.httpVersion
   }
 
+  // Setting this again since the actual request version that was used is found only after ALPN negotiation in case of protocolVersion: auto
+  self._reqResInfo.request.httpVersion = response.httpVersion
+
   if (self.timing) {
     self._reqResInfo.timingStart = self.startTime
     self._reqResInfo.timingStartTimer = self.startTimeNow
@@ -1295,7 +1323,7 @@ Request.prototype.onRequestResponse = function (response) {
   response.toJSON = responseToJSON
 
   // XXX This is different on 0.10, because SSL is strict by default
-  if (self.httpModule === https &&
+  if (self.uri.protocol === 'https:' &&
     self.strictSSL && (!response.hasOwnProperty('socket') ||
       !response.socket.authorized)) {
     debug('strict ssl error', self.uri.href)
@@ -1627,6 +1655,10 @@ Request.prototype.pipeDest = function (dest) {
   }
   if (dest.setHeader && !dest.headersSent) {
     for (var i in response.headers) {
+      if (i.startsWith(':')) {
+        // Don't set HTTP/2 pseudoheaders
+        continue
+      }
       // If the response content is being decoded, the Content-Encoding header
       // of the response doesn't represent the piped content, so don't pass it.
       if (!self.gzip || i !== 'content-encoding') {
@@ -1953,7 +1985,11 @@ Request.prototype.end = function (chunk) {
   if (self.req) {
     self.req.end()
 
-    self.req._header && (self._reqResInfo.request.headers = parseRequestHeaders(self.req._header))
+    // Reference to request, so if _reqResInfo is updated (in case of redirects), we still can update the headers
+    const request = self._reqResInfo.request
+    Promise.resolve(self.req._header).then(function (header) {
+      request.headers = parseRequestHeaders(header)
+    })
   }
 }
 Request.prototype.pause = function () {
